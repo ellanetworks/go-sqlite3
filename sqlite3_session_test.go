@@ -347,3 +347,120 @@ func dumpTable(t *testing.T, db *sql.DB, table, cols string) []string {
 
 	return out
 }
+
+// TestApplyChangesetFilteredSkipsTable applies a two-table changeset whose
+// first table would collide on its primary key. Filtering that table out must
+// leave the collision untouched and still apply the other table.
+func TestApplyChangesetFilteredSkipsTable(t *testing.T) {
+	driver, conns := newSessionDriver(t)
+
+	src, srcPath := openDB(t, driver)
+	defer os.Remove(srcPath)
+	defer src.Close()
+
+	dst, dstPath := openDB(t, driver)
+	defer os.Remove(dstPath)
+	defer dst.Close()
+
+	const schema = `
+		CREATE TABLE skipped (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+		CREATE TABLE kept (id INTEGER PRIMARY KEY, v TEXT NOT NULL);`
+	mustExec(t, src, schema)
+	mustExec(t, dst, schema)
+
+	mustExec(t, dst, "INSERT INTO skipped (id, v) VALUES (1, 'local')")
+
+	srcConn := (*conns)[0]
+	dstConn := (*conns)[1]
+
+	changeset, err := srcConn.CaptureChangeset(context.Background(), func() error {
+		if _, err := src.Exec("INSERT INTO skipped (id, v) VALUES (1, 'replicated')"); err != nil {
+			return err
+		}
+
+		_, err := src.Exec("INSERT INTO kept (id, v) VALUES (7, 'replicated')")
+
+		return err
+	}, []string{"skipped", "kept"})
+	if err != nil {
+		t.Fatalf("CaptureChangeset: %v", err)
+	}
+
+	// Unfiltered, this changeset conflicts on skipped.id = 1.
+	if err := dstConn.ApplyChangeset(context.Background(), changeset); err == nil {
+		t.Fatal("expected unfiltered apply to conflict, got nil")
+	}
+
+	var seen []string
+
+	err = dstConn.ApplyChangesetFiltered(context.Background(), changeset, func(table string) bool {
+		seen = append(seen, table)
+		return table != "skipped"
+	})
+	if err != nil {
+		t.Fatalf("ApplyChangesetFiltered: %v", err)
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("expected filter to see 2 tables, saw %v", seen)
+	}
+
+	var v string
+	if err := dst.QueryRow("SELECT v FROM skipped WHERE id = 1").Scan(&v); err != nil {
+		t.Fatalf("scan skipped: %v", err)
+	}
+
+	if v != "local" {
+		t.Fatalf("filtered table was modified: skipped.id=1 is %q, expected \"local\"", v)
+	}
+
+	if err := dst.QueryRow("SELECT v FROM kept WHERE id = 7").Scan(&v); err != nil {
+		t.Fatalf("scan kept: %v", err)
+	}
+
+	if v != "replicated" {
+		t.Fatalf("kept.id=7 is %q, expected \"replicated\"", v)
+	}
+}
+
+// TestApplyChangesetFilteredNilFilterAcceptsAll pins the documented
+// equivalence between a nil filter and ApplyChangeset.
+func TestApplyChangesetFilteredNilFilterAcceptsAll(t *testing.T) {
+	driver, conns := newSessionDriver(t)
+
+	src, srcPath := openDB(t, driver)
+	defer os.Remove(srcPath)
+	defer src.Close()
+
+	dst, dstPath := openDB(t, driver)
+	defer os.Remove(dstPath)
+	defer dst.Close()
+
+	const schema = `CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);`
+	mustExec(t, src, schema)
+	mustExec(t, dst, schema)
+
+	srcConn := (*conns)[0]
+	dstConn := (*conns)[1]
+
+	changeset, err := srcConn.CaptureChangeset(context.Background(), func() error {
+		_, err := src.Exec("INSERT INTO t (id, v) VALUES (1, 'v1')")
+		return err
+	}, []string{"t"})
+	if err != nil {
+		t.Fatalf("CaptureChangeset: %v", err)
+	}
+
+	if err := dstConn.ApplyChangesetFiltered(context.Background(), changeset, nil); err != nil {
+		t.Fatalf("ApplyChangesetFiltered: %v", err)
+	}
+
+	var v string
+	if err := dst.QueryRow("SELECT v FROM t WHERE id = 1").Scan(&v); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if v != "v1" {
+		t.Fatalf("t.id=1 is %q, expected \"v1\"", v)
+	}
+}

@@ -29,6 +29,16 @@ int ellaChangesetAbort(void *pCtx, int eConflict, sqlite3_changeset_iter *pIter)
     }
     return 2; // SQLITE_CHANGESET_ABORT
 }
+
+// ellaChangesetFilterGo is implemented in Go, in sqlite3_session_filter.go.
+extern int ellaChangesetFilterGo(void *pCtx, char *zTab);
+
+// ellaChangesetFilter adapts that trampoline to the const-qualified signature
+// sqlite3changeset_apply declares for xFilter. Cannot be static, for the same
+// reason as ellaChangesetAbort.
+int ellaChangesetFilter(void *pCtx, const char *zTab) {
+    return ellaChangesetFilterGo(pCtx, (char*)zTab);
+}
 */
 import "C"
 
@@ -230,6 +240,24 @@ func (e *ChangesetConflictError) Error() string {
 // level protocol — on replicated nodes, a conflict means the follower
 // has diverged from the leader and should panic or restore from snapshot.
 func (c *SQLiteConn) ApplyChangeset(ctx context.Context, changeset []byte) error {
+	return c.ApplyChangesetFiltered(ctx, changeset, nil)
+}
+
+// ApplyChangesetFiltered applies changeset, consulting filter to decide which
+// of its tables to apply. SQLite calls filter once per table named in the
+// changeset, before it looks the table up in the local schema; returning false
+// skips every change for that table and leaves the rest of the changeset
+// applied normally. A nil filter accepts every table, making this identical to
+// ApplyChangeset.
+//
+// filter must be a pure function of the table name. A changeset assembled by
+// concatenating two blobs can carry the same table in more than one header, so
+// SQLite may call it more than once for a given name within a single apply.
+func (c *SQLiteConn) ApplyChangesetFiltered(
+	ctx context.Context,
+	changeset []byte,
+	filter func(table string) bool,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -238,7 +266,23 @@ func (c *SQLiteConn) ApplyChangeset(ctx context.Context, changeset []byte) error
 		return nil
 	}
 
-	var conflictCode C.int
+	// The conflict code lives in C memory so its address is stable across the
+	// call and usable as the key identifying this apply's filter.
+	pCtx := C.calloc(1, C.size_t(unsafe.Sizeof(C.int(0))))
+	if pCtx == nil {
+		return fmt.Errorf("allocate changeset apply context")
+	}
+
+	defer C.free(pCtx)
+
+	xFilter := (*[0]byte)(nil)
+
+	if filter != nil {
+		registerApplyFilter(pCtx, filter)
+		defer unregisterApplyFilter(pCtx)
+
+		xFilter = (*[0]byte)(unsafe.Pointer(C.ellaChangesetFilter))
+	}
 
 	// Take address of first byte; sqlite3changeset_apply treats (0, nil)
 	// as an empty changeset, but we already handled that above.
@@ -246,10 +290,13 @@ func (c *SQLiteConn) ApplyChangeset(ctx context.Context, changeset []byte) error
 		c.db,
 		C.int(len(changeset)),
 		unsafe.Pointer(&changeset[0]),
-		nil, // xFilter: nil means accept all tables
+		xFilter,
 		(*[0]byte)(unsafe.Pointer(C.ellaChangesetAbort)),
-		unsafe.Pointer(&conflictCode),
+		pCtx,
 	)
+
+	conflictCode := *(*C.int)(pCtx)
+
 	if rv != C.SQLITE_OK {
 		if conflictCode != 0 {
 			return &ChangesetConflictError{Code: int(conflictCode)}
@@ -260,4 +307,3 @@ func (c *SQLiteConn) ApplyChangeset(ctx context.Context, changeset []byte) error
 
 	return nil
 }
-
