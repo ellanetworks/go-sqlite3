@@ -30,12 +30,8 @@ int ellaChangesetAbort(void *pCtx, int eConflict, sqlite3_changeset_iter *pIter)
     return 2; // SQLITE_CHANGESET_ABORT
 }
 
-// ellaChangesetFilterGo is implemented in Go, in sqlite3_session_filter.go.
 extern int ellaChangesetFilterGo(void *pCtx, char *zTab);
 
-// ellaChangesetFilter adapts that trampoline to the const-qualified signature
-// sqlite3changeset_apply declares for xFilter. Cannot be static, for the same
-// reason as ellaChangesetAbort.
 int ellaChangesetFilter(void *pCtx, const char *zTab) {
     return ellaChangesetFilterGo(pCtx, (char*)zTab);
 }
@@ -243,16 +239,12 @@ func (c *SQLiteConn) ApplyChangeset(ctx context.Context, changeset []byte) error
 	return c.ApplyChangesetFiltered(ctx, changeset, nil)
 }
 
-// ApplyChangesetFiltered applies changeset, consulting filter to decide which
-// of its tables to apply. SQLite calls filter once per table named in the
-// changeset, before it looks the table up in the local schema; returning false
-// skips every change for that table and leaves the rest of the changeset
-// applied normally. A nil filter accepts every table, making this identical to
-// ApplyChangeset.
+// ApplyChangesetFiltered applies changeset, calling filter with each table it
+// names and skipping the tables filter rejects. A nil filter accepts all.
 //
-// filter must be a pure function of the table name. A changeset assembled by
-// concatenating two blobs can carry the same table in more than one header, so
-// SQLite may call it more than once for a given name within a single apply.
+// filter must be a pure function of the table name: SQLite calls it once per
+// table header, and a blob assembled by concatenation can carry the same table
+// in more than one.
 func (c *SQLiteConn) ApplyChangesetFiltered(
 	ctx context.Context,
 	changeset []byte,
@@ -266,8 +258,7 @@ func (c *SQLiteConn) ApplyChangesetFiltered(
 		return nil
 	}
 
-	// The conflict code lives in C memory so its address is stable across the
-	// call and usable as the key identifying this apply's filter.
+	// C memory: the address keys this call's filter, so it must not move.
 	pCtx := C.calloc(1, C.size_t(unsafe.Sizeof(C.int(0))))
 	if pCtx == nil {
 		return fmt.Errorf("allocate changeset apply context")

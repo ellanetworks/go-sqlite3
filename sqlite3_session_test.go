@@ -348,9 +348,6 @@ func dumpTable(t *testing.T, db *sql.DB, table, cols string) []string {
 	return out
 }
 
-// TestApplyChangesetFilteredSkipsTable applies a two-table changeset whose
-// first table would collide on its primary key. Filtering that table out must
-// leave the collision untouched and still apply the other table.
 func TestApplyChangesetFilteredSkipsTable(t *testing.T) {
 	driver, conns := newSessionDriver(t)
 
@@ -386,7 +383,6 @@ func TestApplyChangesetFilteredSkipsTable(t *testing.T) {
 		t.Fatalf("CaptureChangeset: %v", err)
 	}
 
-	// Unfiltered, this changeset conflicts on skipped.id = 1.
 	if err := dstConn.ApplyChangeset(context.Background(), changeset); err == nil {
 		t.Fatal("expected unfiltered apply to conflict, got nil")
 	}
@@ -423,8 +419,6 @@ func TestApplyChangesetFilteredSkipsTable(t *testing.T) {
 	}
 }
 
-// TestApplyChangesetFilteredNilFilterAcceptsAll pins the documented
-// equivalence between a nil filter and ApplyChangeset.
 func TestApplyChangesetFilteredNilFilterAcceptsAll(t *testing.T) {
 	driver, conns := newSessionDriver(t)
 
